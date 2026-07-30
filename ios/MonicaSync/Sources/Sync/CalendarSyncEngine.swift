@@ -8,22 +8,26 @@ struct CalendarSyncSummary {
     var deleted = 0
 }
 
-/// Mirrors Monica reminders (birthdays, stay-in-touch, …) and logged
-/// activities into a dedicated "Monica" calendar on the device.
+/// Mirrors Monica reminders (birthdays, stay-in-touch, …) — and, on servers
+/// that log them, activities — into a calendar on the device.
+///
+/// The target calendar is chosen by the user in Settings — either an existing
+/// calendar or a dedicated "Monica" calendar the app creates. Only events the
+/// app created (tagged in their notes) are ever touched.
 ///
 /// This direction is one-way: Monica is the source of truth. Reminders become
 /// (optionally recurring) all-day events with a morning alarm; activities
 /// become all-day events on the day they happened.
 final class CalendarSyncEngine {
-    private let client: MonicaAPIClient
+    private let backend: any MonicaBackend
     private let mappings: SyncMappingStore
     private let settings: SyncSettings
     private let store: EKEventStore
 
-    private static let calendarName = "Monica"
+    private static let dedicatedCalendarName = "Monica"
 
-    init(client: MonicaAPIClient, mappings: SyncMappingStore, settings: SyncSettings, store: EKEventStore) {
-        self.client = client
+    init(backend: any MonicaBackend, mappings: SyncMappingStore, settings: SyncSettings, store: EKEventStore) {
+        self.backend = backend
         self.mappings = mappings
         self.settings = settings
         self.store = store
@@ -32,7 +36,6 @@ final class CalendarSyncEngine {
     /// Everything needed to create or refresh one mirrored event.
     private struct DesiredEvent {
         let key: String
-        let remoteID: Int
         let tagLine: String
         let fingerprint: String
         let configure: (EKEvent) -> Void
@@ -42,11 +45,11 @@ final class CalendarSyncEngine {
 
     func sync() async throws -> CalendarSyncSummary {
         try await ensureAccess()
-        let calendar = try ensureCalendar()
+        let calendar = try resolveTargetCalendar()
 
         var summary = CalendarSyncSummary()
-        async let remindersRequest = client.fetchAllReminders()
-        async let activitiesRequest = client.fetchAllActivities()
+        async let remindersRequest = backend.fetchReminders()
+        async let activitiesRequest = backend.fetchActivities()
         let reminders = try await remindersRequest
         let activities = try await activitiesRequest
 
@@ -87,7 +90,17 @@ final class CalendarSyncEngine {
         throw SyncError.permissionDenied("Calendar")
     }
 
-    private func ensureCalendar() throws -> EKCalendar {
+    /// The user-chosen calendar, or a dedicated "Monica" calendar when no
+    /// choice was made (created on first use, reused afterwards).
+    private func resolveTargetCalendar() throws -> EKCalendar {
+        if let chosenID = settings.calendarTargetID {
+            if let calendar = store.calendar(withIdentifier: chosenID),
+               calendar.allowsContentModifications {
+                return calendar
+            }
+            // The chosen calendar is gone — fall back to the dedicated one.
+        }
+
         let defaults = UserDefaults.standard
         if let id = defaults.string(forKey: SyncSettings.Keys.eventCalendarID),
            let calendar = store.calendar(withIdentifier: id),
@@ -95,13 +108,13 @@ final class CalendarSyncEngine {
             return calendar
         }
         if let existing = store.calendars(for: .event)
-            .first(where: { $0.title == Self.calendarName && $0.allowsContentModifications }) {
+            .first(where: { $0.title == Self.dedicatedCalendarName && $0.allowsContentModifications }) {
             defaults.set(existing.calendarIdentifier, forKey: SyncSettings.Keys.eventCalendarID)
             return existing
         }
 
         let calendar = EKCalendar(for: .event, eventStore: store)
-        calendar.title = Self.calendarName
+        calendar.title = Self.dedicatedCalendarName
         calendar.cgColor = UIColor.systemIndigo.cgColor
         guard let source = store.defaultCalendarForNewEvents?.source
             ?? store.sources.first(where: { $0.sourceType == .calDAV })
@@ -173,77 +186,84 @@ final class CalendarSyncEngine {
 
     // MARK: - Desired state builders
 
-    private static func desiredEvent(forReminder reminder: MonicaReminder) -> DesiredEvent? {
-        guard let nextDate = reminder.nextExpectedDate else { return nil }
-        let startDate = localAllDayStart(for: nextDate)
-        let title = reminder.title ?? "Reminder"
+    private static func desiredEvent(forReminder reminder: SyncReminder) -> DesiredEvent? {
+        guard let components = reminder.nextDate,
+              let dayKey = components.syncDayKey,
+              let startDate = components.nextLocalDate()
+        else { return nil }
+
+        let frequencyKey: String
+        switch reminder.frequency {
+        case .oneTime: frequencyKey = "once"
+        case .daily(let interval): frequencyKey = "daily:\(interval)"
+        case .weekly(let interval): frequencyKey = "weekly:\(interval)"
+        case .monthly(let interval): frequencyKey = "monthly:\(interval)"
+        case .yearly(let interval): frequencyKey = "yearly:\(interval)"
+        }
+
         let fingerprint = Fingerprint.of([
-            title,
-            reminder.description,
-            allDayKey(for: nextDate),
-            reminder.frequencyType,
-            reminder.frequencyNumber.map(String.init),
-            reminder.contact?.displayName,
+            reminder.title,
+            reminder.details,
+            dayKey,
+            frequencyKey,
+            reminder.contactName,
         ])
 
         return DesiredEvent(
             key: SyncMappingStore.key("reminder", reminder.id),
-            remoteID: reminder.id,
             tagLine: SyncTag.reminder(reminder.id),
             fingerprint: fingerprint
         ) { event in
-            event.title = title
+            event.title = reminder.title
             event.isAllDay = true
             event.startDate = startDate
             event.endDate = startDate.addingTimeInterval(24 * 3600 - 1)
 
             var noteLines: [String] = []
-            if let description = reminder.description, !description.isEmpty {
-                noteLines.append(description)
+            if let details = reminder.details, !details.isEmpty {
+                noteLines.append(details)
             }
-            if let contact = reminder.contact {
-                noteLines.append("For: \(contact.displayName)")
+            if let contactName = reminder.contactName {
+                noteLines.append("For: \(contactName)")
             }
             noteLines.append(SyncTag.reminder(reminder.id))
             event.notes = noteLines.joined(separator: "\n")
 
-            event.recurrenceRules = recurrenceRules(
-                frequencyType: reminder.frequencyType,
-                frequencyNumber: reminder.frequencyNumber
-            )
+            event.recurrenceRules = recurrenceRules(for: reminder.frequency)
             // Morning-of alert, mirroring Monica's own morning email.
             event.alarms = [EKAlarm(relativeOffset: 9 * 3600)]
         }
     }
 
-    private static func desiredEvent(forActivity activity: MonicaActivity) -> DesiredEvent? {
-        guard let happenedAt = activity.happenedAt else { return nil }
-        let startDate = localAllDayStart(for: happenedAt)
-        let title = activity.summary ?? "Activity"
+    private static func desiredEvent(forActivity activity: SyncActivity) -> DesiredEvent? {
+        guard let components = activity.date,
+              let dayKey = components.syncDayKey,
+              let startDate = components.nextLocalDate()
+        else { return nil }
+
         let fingerprint = Fingerprint.of([
-            title,
-            activity.description,
-            allDayKey(for: happenedAt),
-            activity.attendeeNames.sorted().joined(separator: "|"),
+            activity.title,
+            activity.details,
+            dayKey,
+            activity.attendees.sorted().joined(separator: "|"),
         ])
 
         return DesiredEvent(
             key: SyncMappingStore.key("activity", activity.id),
-            remoteID: activity.id,
             tagLine: SyncTag.activity(activity.id),
             fingerprint: fingerprint
         ) { event in
-            event.title = title
+            event.title = activity.title
             event.isAllDay = true
             event.startDate = startDate
             event.endDate = startDate.addingTimeInterval(24 * 3600 - 1)
 
             var noteLines: [String] = []
-            if let description = activity.description, !description.isEmpty {
-                noteLines.append(description)
+            if let details = activity.details, !details.isEmpty {
+                noteLines.append(details)
             }
-            if !activity.attendeeNames.isEmpty {
-                noteLines.append("With: \(activity.attendeeNames.joined(separator: ", "))")
+            if !activity.attendees.isEmpty {
+                noteLines.append("With: \(activity.attendees.joined(separator: ", "))")
             }
             noteLines.append(SyncTag.activity(activity.id))
             event.notes = noteLines.joined(separator: "\n")
@@ -252,50 +272,37 @@ final class CalendarSyncEngine {
         }
     }
 
-    private static func recurrenceRules(
-        frequencyType: String?,
-        frequencyNumber: Int?
-    ) -> [EKRecurrenceRule]? {
-        let frequency: EKRecurrenceFrequency
-        switch frequencyType?.lowercased() {
-        case .some(let type) where type.hasPrefix("week"): frequency = .weekly
-        case .some(let type) where type.hasPrefix("month"): frequency = .monthly
-        case .some(let type) where type.hasPrefix("year"): frequency = .yearly
-        default: return nil
+    private static func recurrenceRules(for frequency: SyncFrequency) -> [EKRecurrenceRule]? {
+        let ekFrequency: EKRecurrenceFrequency
+        let interval: Int
+        switch frequency {
+        case .oneTime:
+            return nil
+        case .daily(let value):
+            ekFrequency = .daily
+            interval = value
+        case .weekly(let value):
+            ekFrequency = .weekly
+            interval = value
+        case .monthly(let value):
+            ekFrequency = .monthly
+            interval = value
+        case .yearly(let value):
+            ekFrequency = .yearly
+            interval = value
         }
         return [
             EKRecurrenceRule(
-                recurrenceWith: frequency,
-                interval: max(1, frequencyNumber ?? 1),
+                recurrenceWith: ekFrequency,
+                interval: max(1, interval),
                 end: nil
             )
         ]
     }
 
-    /// Monica stores day-precision dates in UTC; render them as local all-day
-    /// events on the same calendar day.
-    private static func localAllDayStart(for date: Date) -> Date {
-        var utc = Calendar(identifier: .gregorian)
-        utc.timeZone = TimeZone(identifier: "UTC") ?? .current
-        let components = utc.dateComponents([.year, .month, .day], from: date)
-        var local = Calendar.current
-        local.timeZone = .current
-        return local.date(from: components) ?? date
-    }
-
-    private static func allDayKey(for date: Date) -> String {
-        var utc = Calendar(identifier: .gregorian)
-        utc.timeZone = TimeZone(identifier: "UTC") ?? .current
-        let components = utc.dateComponents([.year, .month, .day], from: date)
-        return String(
-            format: "%04d-%02d-%02d",
-            components.year ?? 0, components.month ?? 0, components.day ?? 0
-        )
-    }
-
     // MARK: - Adoption & orphans
 
-    /// Scans the Monica calendar (±2 years) for events carrying our marker so
+    /// Scans the target calendar (±2 years) for events carrying our marker so
     /// reinstalls re-link instead of duplicating.
     private func buildAdoptionIndex(in calendar: EKCalendar) -> [String: EKEvent] {
         let now = Date()
@@ -316,12 +323,11 @@ final class CalendarSyncEngine {
         return index
     }
 
-    private func removeOrphans(prefix: String, remoteIDs: Set<Int>) -> Int {
+    private func removeOrphans(prefix: String, remoteIDs: Set<String>) -> Int {
         var removed = 0
         for key in mappings.keys(withPrefix: prefix) {
-            guard let id = Int(key.split(separator: ":")[1]), !remoteIDs.contains(id),
-                  let record = mappings[key]
-            else { continue }
+            let id = String(key.dropFirst(prefix.count))
+            guard !remoteIDs.contains(id), let record = mappings[key] else { continue }
             if !record.deletedLocally,
                let event = store.event(withIdentifier: record.localIdentifier) {
                 if (try? store.remove(event, span: .futureEvents, commit: true)) != nil {

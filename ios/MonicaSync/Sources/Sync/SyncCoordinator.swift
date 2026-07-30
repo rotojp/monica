@@ -51,7 +51,7 @@ final class SyncCoordinator {
 
     func sync(model: AppModel) async {
         guard !isSyncing else { return }
-        guard let client = model.client else { return }
+        guard let backend = model.backend else { return }
 
         isSyncing = true
         defer { isSyncing = false }
@@ -64,7 +64,7 @@ final class SyncCoordinator {
             contactsState = .running
             do {
                 let engine = ContactsSyncEngine(
-                    client: client, mappings: mappings, settings: settings
+                    backend: backend, mappings: mappings, settings: settings
                 )
                 let summary = try await engine.sync()
                 var text = "\(summary.created) added · \(summary.updated) updated · \(summary.deleted) removed"
@@ -83,7 +83,7 @@ final class SyncCoordinator {
             tasksState = .running
             do {
                 let engine = RemindersSyncEngine(
-                    client: client, mappings: mappings, settings: settings, store: eventStore
+                    backend: backend, mappings: mappings, settings: settings, store: eventStore
                 )
                 let summary = try await engine.sync()
                 var text = "\(summary.created) added · \(summary.updated) updated · \(summary.deleted) removed"
@@ -102,7 +102,7 @@ final class SyncCoordinator {
             calendarState = .running
             do {
                 let engine = CalendarSyncEngine(
-                    client: client, mappings: mappings, settings: settings, store: eventStore
+                    backend: backend, mappings: mappings, settings: settings, store: eventStore
                 )
                 let summary = try await engine.sync()
                 calendarState = .success(

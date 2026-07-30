@@ -5,15 +5,14 @@ import SwiftUI
 struct ContactsListView: View {
     @Environment(AppModel.self) private var model
 
-    @State private var contacts: [MonicaContact] = []
+    @State private var contacts: [SyncContact] = []
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var searchText = ""
 
-    private var filtered: [MonicaContact] {
-        let visible = contacts.filter { ($0.isPartial ?? false) == false }
-        guard !searchText.isEmpty else { return visible }
-        return visible.filter {
+    private var filtered: [SyncContact] {
+        guard !searchText.isEmpty else { return contacts }
+        return contacts.filter {
             $0.displayName.localizedCaseInsensitiveContains(searchText)
         }
     }
@@ -36,7 +35,7 @@ struct ContactsListView: View {
                 }
             }
             .navigationTitle("People")
-            .navigationDestination(for: Int.self) { id in
+            .navigationDestination(for: String.self) { id in
                 ContactDetailView(contactID: id)
             }
             .task { await load() }
@@ -44,11 +43,11 @@ struct ContactsListView: View {
     }
 
     private func load() async {
-        guard let client = model.client else { return }
+        guard let backend = model.backend else { return }
         isLoading = true
         errorMessage = nil
         do {
-            contacts = try await client.fetchAllContacts()
+            contacts = try await backend.fetchContacts()
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -57,7 +56,7 @@ struct ContactsListView: View {
 }
 
 private struct ContactRow: View {
-    let contact: MonicaContact
+    let contact: SyncContact
 
     var body: some View {
         HStack(spacing: 12) {
@@ -66,18 +65,17 @@ private struct ContactRow: View {
                 HStack(spacing: 4) {
                     Text(contact.displayName)
                         .font(.body)
-                    if contact.isStarred == true {
+                    if contact.isStarred {
                         Image(systemName: "star.fill")
                             .font(.caption2)
                             .foregroundStyle(.yellow)
                     }
                 }
-                if let career = contact.information?.career,
-                   let subtitle = [career.job, career.company]
-                       .compactMap({ $0 })
-                       .filter({ !$0.isEmpty })
-                       .joined(separator: " · ")
-                       .nilIfEmpty {
+                if let subtitle = [contact.jobTitle, contact.company]
+                    .compactMap({ $0 })
+                    .filter({ !$0.isEmpty })
+                    .joined(separator: " · ")
+                    .nilIfEmpty {
                     Text(subtitle)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -95,13 +93,13 @@ extension String {
 
 struct ContactDetailView: View {
     @Environment(AppModel.self) private var model
-    let contactID: Int
+    let contactID: String
 
-    @State private var contact: MonicaContact?
-    @State private var tasks: [MonicaTask] = []
-    @State private var reminders: [MonicaReminder] = []
-    @State private var activities: [MonicaActivity] = []
-    @State private var calls: [MonicaCall] = []
+    @State private var contact: SyncContact?
+    @State private var tasks: [SyncTask] = []
+    @State private var reminders: [SyncReminder] = []
+    @State private var activities: [SyncActivity] = []
+    @State private var calls: [SyncCall] = []
     @State private var errorMessage: String?
     @State private var showLogCall = false
     @State private var showAddTask = false
@@ -128,27 +126,25 @@ struct ContactDetailView: View {
     }
 
     @ViewBuilder
-    private func detailList(for contact: MonicaContact) -> some View {
+    private func detailList(for contact: SyncContact) -> some View {
         List {
             Section {
                 HStack(spacing: 16) {
                     InitialsAvatar(initials: contact.initials, size: 56)
                     VStack(alignment: .leading, spacing: 4) {
                         Text(contact.displayName).font(.title3.bold())
-                        if let career = contact.information?.career,
-                           let line = [career.job, career.company]
-                               .compactMap({ $0 })
-                               .filter({ !$0.isEmpty })
-                               .joined(separator: " at ")
-                               .nilIfEmpty {
+                        if let line = [contact.jobTitle, contact.company]
+                            .compactMap({ $0 })
+                            .filter({ !$0.isEmpty })
+                            .joined(separator: " at ")
+                            .nilIfEmpty {
                             Text(line).font(.callout).foregroundStyle(.secondary)
                         }
                     }
                 }
                 .padding(.vertical, 4)
 
-                if let webURL = model.client?.serverConfig
-                    .webURL(forContactID: contact.id, hashID: contact.hashID) {
+                if let webURL = URL(string: contact.webURL) {
                     Link(destination: webURL) {
                         Label("Open in Monica", systemImage: "safari")
                     }
@@ -175,26 +171,23 @@ struct ContactDetailView: View {
                 }
             }
 
-            if let birthdate = contact.information?.dates?.birthdate?.date {
+            if let birthday = contact.birthday {
                 Section("Birthday") {
-                    Label(
-                        birthdate.formatted(date: .abbreviated, time: .omitted),
-                        systemImage: "birthday.cake"
-                    )
+                    Label(birthdayText(birthday), systemImage: "birthday.cake")
                 }
             }
 
-            if let addresses = contact.addresses, !addresses.isEmpty {
+            if !contact.addresses.isEmpty {
                 Section("Addresses") {
-                    ForEach(addresses) { address in
+                    ForEach(Array(contact.addresses.enumerated()), id: \.offset) { _, address in
                         let query = address.oneLine
                             .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
                         if let url = URL(string: "https://maps.apple.com/?q=\(query)") {
                             Link(destination: url) {
                                 Label {
                                     VStack(alignment: .leading) {
-                                        if let name = address.name, !name.isEmpty {
-                                            Text(name).font(.caption).foregroundStyle(.secondary)
+                                        if let label = address.label, !label.isEmpty {
+                                            Text(label).font(.caption).foregroundStyle(.secondary)
                                         }
                                         Text(address.oneLine)
                                     }
@@ -210,7 +203,7 @@ struct ContactDetailView: View {
             Section {
                 ForEach(tasks) { task in
                     Label(
-                        task.title ?? "Task",
+                        task.title,
                         systemImage: task.isCompleted ? "checkmark.circle.fill" : "circle"
                     )
                     .foregroundStyle(task.isCompleted ? .secondary : .primary)
@@ -228,8 +221,8 @@ struct ContactDetailView: View {
                 Section("Reminders") {
                     ForEach(reminders) { reminder in
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(reminder.title ?? "Reminder")
-                            if let next = reminder.nextExpectedDate {
+                            Text(reminder.title)
+                            if let next = reminder.nextDate?.nextLocalDate() {
                                 Text(next.formatted(date: .abbreviated, time: .omitted))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
@@ -242,8 +235,8 @@ struct ContactDetailView: View {
             Section {
                 ForEach(calls) { call in
                     VStack(alignment: .leading, spacing: 2) {
-                        if let calledAt = call.calledAt {
-                            Text(calledAt.formatted(date: .abbreviated, time: .omitted))
+                        if let date = call.date {
+                            Text(date.formatted(date: .abbreviated, time: .omitted))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -263,12 +256,12 @@ struct ContactDetailView: View {
                 Section("Activities") {
                     ForEach(activities) { activity in
                         VStack(alignment: .leading, spacing: 2) {
-                            if let happenedAt = activity.happenedAt {
-                                Text(happenedAt.formatted(date: .abbreviated, time: .omitted))
+                            if let date = activity.date?.nextLocalDate() {
+                                Text(date.formatted(date: .abbreviated, time: .omitted))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
-                            Text(activity.summary ?? "Activity")
+                            Text(activity.title)
                         }
                     }
                 }
@@ -276,15 +269,29 @@ struct ContactDetailView: View {
         }
     }
 
+    private func birthdayText(_ birthday: SyncBirthday) -> String {
+        var components = DateComponents()
+        components.day = birthday.day
+        components.month = birthday.month
+        components.year = birthday.year
+        guard let date = Calendar.current.date(from: components) else {
+            return "\(birthday.day).\(birthday.month)."
+        }
+        if birthday.year != nil {
+            return date.formatted(date: .abbreviated, time: .omitted)
+        }
+        return date.formatted(.dateTime.day().month(.wide))
+    }
+
     private func load() async {
-        guard let client = model.client else { return }
+        guard let backend = model.backend else { return }
         errorMessage = nil
         do {
-            async let contactRequest = client.fetchContact(id: contactID)
-            async let tasksRequest = client.fetchTasks(contactID: contactID)
-            async let remindersRequest = client.fetchReminders(contactID: contactID)
-            async let activitiesRequest = client.fetchActivities(contactID: contactID)
-            async let callsRequest = client.fetchCalls(contactID: contactID)
+            async let contactRequest = backend.fetchContact(id: contactID)
+            async let tasksRequest = backend.fetchContactTasks(contactID: contactID)
+            async let remindersRequest = backend.fetchContactReminders(contactID: contactID)
+            async let activitiesRequest = backend.fetchContactActivities(contactID: contactID)
+            async let callsRequest = backend.fetchContactCalls(contactID: contactID)
             contact = try await contactRequest
             tasks = (try? await tasksRequest) ?? []
             reminders = (try? await remindersRequest) ?? []
@@ -302,7 +309,7 @@ private struct LogCallSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
 
-    let contactID: Int
+    let contactID: String
     let onSaved: () async -> Void
 
     @State private var content = ""
@@ -335,13 +342,11 @@ private struct LogCallSheet: View {
     }
 
     private func save() {
-        guard let client = model.client else { return }
+        guard let backend = model.backend else { return }
         isSaving = true
         Task {
             do {
-                try await client.createCall(
-                    contactID: contactID, content: content, calledAt: calledAt
-                )
+                try await backend.logCall(contactID: contactID, content: content, date: calledAt)
                 await onSaved()
                 dismiss()
             } catch {
@@ -356,7 +361,7 @@ private struct AddTaskSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
 
-    let contactID: Int
+    let contactID: String
     let onSaved: () async -> Void
 
     @State private var title = ""
@@ -389,13 +394,11 @@ private struct AddTaskSheet: View {
     }
 
     private func save() {
-        guard let client = model.client else { return }
+        guard let backend = model.backend else { return }
         isSaving = true
         Task {
             do {
-                try await client.createTask(
-                    contactID: contactID, title: title, description: details
-                )
+                try await backend.createTask(contactID: contactID, title: title, details: details)
                 await onSaved()
                 dismiss()
             } catch {

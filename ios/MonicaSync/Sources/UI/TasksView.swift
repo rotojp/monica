@@ -1,16 +1,17 @@
 import SwiftUI
 
-/// All tasks across the account. Completing a task here writes straight to
-/// the Monica server; the mirrored reminder follows on the next sync.
+/// All tasks in the account (v4) or the selected vault (v5). Completing a
+/// task here writes straight to the Monica server; the mirrored reminder
+/// follows on the next sync.
 struct TasksView: View {
     @Environment(AppModel.self) private var model
 
-    @State private var tasks: [MonicaTask] = []
+    @State private var tasks: [SyncTask] = []
     @State private var isLoading = false
     @State private var errorMessage: String?
 
-    private var openTasks: [MonicaTask] { tasks.filter { !$0.isCompleted } }
-    private var completedTasks: [MonicaTask] { tasks.filter(\.isCompleted) }
+    private var openTasks: [SyncTask] { tasks.filter { !$0.isCompleted } }
+    private var completedTasks: [SyncTask] { tasks.filter(\.isCompleted) }
 
     var body: some View {
         NavigationStack {
@@ -51,26 +52,22 @@ struct TasksView: View {
     }
 
     private func load() async {
-        guard let client = model.client else { return }
+        guard let backend = model.backend else { return }
         isLoading = true
         errorMessage = nil
         do {
-            tasks = try await client.fetchAllTasks()
+            tasks = try await backend.fetchTasks()
         } catch {
             errorMessage = error.localizedDescription
         }
         isLoading = false
     }
 
-    private func toggle(_ task: MonicaTask) {
-        guard let client = model.client else { return }
+    private func toggle(_ task: SyncTask) {
+        guard let backend = model.backend else { return }
         Task {
             do {
-                try await client.updateTask(
-                    task,
-                    title: task.title ?? "Task",
-                    completed: !task.isCompleted
-                )
+                try await backend.setTask(task, title: task.title, completed: !task.isCompleted)
                 await load()
             } catch {
                 errorMessage = error.localizedDescription
@@ -80,7 +77,7 @@ struct TasksView: View {
 }
 
 private struct TaskRow: View {
-    let task: MonicaTask
+    let task: SyncTask
     let onToggle: () -> Void
 
     var body: some View {
@@ -93,11 +90,11 @@ private struct TaskRow: View {
             .buttonStyle(.plain)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(task.title ?? "Task")
+                Text(task.title)
                     .strikethrough(task.isCompleted)
                     .foregroundStyle(task.isCompleted ? .secondary : .primary)
-                if let contact = task.contact {
-                    Text(contact.displayName)
+                if let contactName = task.contactName {
+                    Text(contactName)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

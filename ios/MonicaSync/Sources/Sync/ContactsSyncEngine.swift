@@ -11,14 +11,16 @@ struct ContactSyncSummary {
 /// Mirrors Monica people into the iPhone address book.
 ///
 /// - Monica is the source of truth: server-side edits always win.
+/// - When "sync only selected contacts" is on, only the chosen people are
+///   mirrored; deselecting someone removes their mirror on the next pass.
 /// - Every mirrored contact carries a "Monica" URL pointing at its profile on
 ///   the server. The URL doubles as an adoption marker, so reinstalling the
 ///   app re-links existing contacts instead of duplicating them.
 /// - Local edits are preserved until the same contact changes on the server;
 ///   with "push local changes" enabled, email/phone edits made on the device
-///   are written back to Monica as contact fields.
+///   are written back to Monica.
 final class ContactsSyncEngine {
-    private let client: MonicaAPIClient
+    private let backend: any MonicaBackend
     private let mappings: SyncMappingStore
     private let settings: SyncSettings
     private let store = CNContactStore()
@@ -39,8 +41,8 @@ final class ContactsSyncEngine {
         CNContactBirthdayKey as CNKeyDescriptor,
     ]
 
-    init(client: MonicaAPIClient, mappings: SyncMappingStore, settings: SyncSettings) {
-        self.client = client
+    init(backend: any MonicaBackend, mappings: SyncMappingStore, settings: SyncSettings) {
+        self.backend = backend
         self.mappings = mappings
         self.settings = settings
     }
@@ -51,21 +53,26 @@ final class ContactsSyncEngine {
         try await ensureAccess()
 
         var summary = ContactSyncSummary()
-        let remoteContacts = try await client.fetchAllContacts().filter(\.isSyncable)
-        let adoptionIndex = buildAdoptionIndex()
-        var fieldTypes: [MonicaContactFieldType]?
 
-        for remote in remoteContacts {
-            try await syncOne(
-                remote,
-                adoptionIndex: adoptionIndex,
-                fieldTypes: &fieldTypes,
-                summary: &summary
-            )
+        // Selection turned on but nothing picked yet: treat as "not configured"
+        // rather than as "mirror nobody" — otherwise flipping the toggle would
+        // wipe every mirrored contact before the user gets to choose.
+        if settings.contactSelectionEnabled && settings.selectedContactIDs.isEmpty {
+            return summary
+        }
+
+        let selected = try await backend.fetchContacts()
+            .filter { settings.includesContact(id: $0.id) }
+        let adoptionIndex = buildAdoptionIndex()
+
+        for remote in selected {
+            try await syncOne(remote, adoptionIndex: adoptionIndex, summary: &summary)
         }
 
         if settings.removeOrphans {
-            summary.deleted += removeOrphans(remoteIDs: Set(remoteContacts.map(\.id)))
+            // Anything mapped but no longer on the server — or no longer
+            // selected — loses its mirror.
+            summary.deleted += removeOrphans(remoteIDs: Set(selected.map(\.id)))
         }
 
         mappings.save()
@@ -87,15 +94,11 @@ final class ContactsSyncEngine {
     // MARK: - Per-contact sync
 
     private func syncOne(
-        _ remote: MonicaContact,
+        _ remote: SyncContact,
         adoptionIndex: [String: String],
-        fieldTypes: inout [MonicaContactFieldType]?,
         summary: inout ContactSyncSummary
     ) async throws {
         let key = SyncMappingStore.key("contact", remote.id)
-        let webURL = client.serverConfig
-            .webURL(forContactID: remote.id, hashID: remote.hashID)
-            .absoluteString
         let remoteFingerprint = Fingerprint.of(Self.remoteParts(of: remote))
 
         var record = mappings[key]
@@ -114,7 +117,7 @@ final class ContactsSyncEngine {
 
         // No mapping yet: adopt a contact that already carries our marker URL
         // (e.g. after a reinstall) before creating a duplicate.
-        if record == nil, let adoptedID = adoptionIndex[webURL],
+        if record == nil, let adoptedID = adoptionIndex[remote.webURL],
            let adopted = fetchLocal(adoptedID) {
             record = SyncRecord(
                 localIdentifier: adoptedID,
@@ -133,11 +136,13 @@ final class ContactsSyncEngine {
 
             if localChanged && !remoteChanged {
                 guard settings.pushLocalContactChanges else { return }
-                try await pushLocalFieldChanges(local: local, remote: remote, fieldTypes: &fieldTypes)
+                let changes = Self.fieldChanges(local: local, remote: remote)
+                guard !changes.isEmpty else { return }
+                try await backend.pushContactFieldChanges(contact: remote, changes: changes)
                 summary.pushedToServer += 1
                 // Re-fetch so the stored remote baseline includes the fields
                 // we just wrote.
-                let refreshed = (try? await client.fetchContact(id: remote.id)) ?? remote
+                let refreshed = (try? await backend.fetchContact(id: remote.id)) ?? remote
                 mappings[key] = SyncRecord(
                     localIdentifier: currentRecord.localIdentifier,
                     remoteFingerprint: Fingerprint.of(Self.remoteParts(of: refreshed)),
@@ -148,7 +153,7 @@ final class ContactsSyncEngine {
 
             // Server-side change (possibly alongside a local one): Monica wins.
             let mutable = local.mutableCopy() as! CNMutableContact
-            apply(remote, webURL: webURL, to: mutable, avatarData: nil)
+            apply(remote, to: mutable, avatarData: nil)
             let request = CNSaveRequest()
             request.update(mutable)
             try store.execute(request)
@@ -163,8 +168,11 @@ final class ContactsSyncEngine {
 
         // Brand new: create the mirror.
         let created = CNMutableContact()
-        let avatarData = await fetchAvatarIfAny(for: remote)
-        apply(remote, webURL: webURL, to: created, avatarData: avatarData)
+        var avatarData: Data?
+        if let avatarURL = remote.avatarURL {
+            avatarData = await backend.fetchAvatarData(from: avatarURL)
+        }
+        apply(remote, to: created, avatarData: avatarData)
         let request = CNSaveRequest()
         request.add(created, toContainerWithIdentifier: nil)
         if let group = try? ensureGroup() {
@@ -181,17 +189,12 @@ final class ContactsSyncEngine {
 
     // MARK: - Applying remote state
 
-    private func apply(
-        _ remote: MonicaContact,
-        webURL: String,
-        to contact: CNMutableContact,
-        avatarData: Data?
-    ) {
+    private func apply(_ remote: SyncContact, to contact: CNMutableContact, avatarData: Data?) {
         contact.givenName = remote.firstName ?? ""
         contact.familyName = remote.lastName ?? ""
         contact.nickname = remote.nickname ?? ""
-        contact.organizationName = remote.information?.career?.company ?? ""
-        contact.jobTitle = remote.information?.career?.job ?? ""
+        contact.organizationName = remote.company ?? ""
+        contact.jobTitle = remote.jobTitle ?? ""
 
         contact.emailAddresses = remote.emails.map {
             CNLabeledValue(label: CNLabelHome, value: $0 as NSString)
@@ -200,34 +203,32 @@ final class ContactsSyncEngine {
             CNLabeledValue(label: CNLabelPhoneNumberMain, value: CNPhoneNumber(stringValue: $0))
         }
 
-        contact.postalAddresses = (remote.addresses ?? []).map { address in
+        contact.postalAddresses = remote.addresses.map { address in
             let postal = CNMutablePostalAddress()
             postal.street = address.street ?? ""
             postal.city = address.city ?? ""
             postal.state = address.province ?? ""
             postal.postalCode = address.postalCode ?? ""
-            postal.country = address.country?.name ?? ""
+            postal.country = address.country ?? ""
             let label: String
-            switch address.name?.lowercased() {
+            switch address.label?.lowercased() {
             case "home": label = CNLabelHome
             case "work": label = CNLabelWork
-            default: label = address.name ?? CNLabelOther
+            default: label = address.label ?? CNLabelOther
             }
             return CNLabeledValue(label: label, value: postal)
         }
 
         // Keep any URLs the user added themselves; ours is identified by label.
         var urls = contact.urlAddresses.filter { $0.label != Self.urlLabel }
-        urls.insert(CNLabeledValue(label: Self.urlLabel, value: webURL as NSString), at: 0)
+        urls.insert(CNLabeledValue(label: Self.urlLabel, value: remote.webURL as NSString), at: 0)
         contact.urlAddresses = urls
 
-        if let birthdate = remote.information?.dates?.birthdate,
-           let date = birthdate.date,
-           birthdate.isAgeBased != true {
-            var calendar = Calendar(identifier: .gregorian)
-            calendar.timeZone = TimeZone(identifier: "UTC") ?? .current
-            var components = calendar.dateComponents([.year, .month, .day], from: date)
-            if birthdate.isYearUnknown == true { components.year = nil }
+        if let birthday = remote.birthday {
+            var components = DateComponents()
+            components.day = birthday.day
+            components.month = birthday.month
+            components.year = birthday.year
             contact.birthday = components
         } else {
             contact.birthday = nil
@@ -238,76 +239,34 @@ final class ContactsSyncEngine {
         }
     }
 
-    private func fetchAvatarIfAny(for remote: MonicaContact) async -> Data? {
-        guard let avatar = remote.information?.avatar,
-              let url = avatar.url,
-              avatar.source != "default"
-        else { return nil }
-        return await client.fetchAvatarData(from: url)
-    }
+    // MARK: - Local edit detection
 
-    // MARK: - Pushing local edits
+    /// Device-side email/phone additions and removals relative to the server.
+    static func fieldChanges(local: CNContact, remote: SyncContact) -> ContactFieldChanges {
+        var changes = ContactFieldChanges()
 
-    /// Writes device-side email/phone additions and removals back to Monica
-    /// as contact fields. Other fields stay device-only until the server-side
-    /// contact changes.
-    private func pushLocalFieldChanges(
-        local: CNContact,
-        remote: MonicaContact,
-        fieldTypes: inout [MonicaContactFieldType]?
-    ) async throws {
-        if fieldTypes == nil {
-            fieldTypes = try await client.fetchContactFieldTypes()
-        }
-        guard let types = fieldTypes else { return }
-        let emailType = types.first { $0.kind(matches: "email") }
-        let phoneType = types.first { $0.kind(matches: "phone") }
+        let localEmails = local.emailAddresses.map { ($0.value as String) }
+        let localEmailSet = Set(localEmails.map { $0.lowercased() })
+        let remoteEmailSet = Set(remote.emails.map { $0.lowercased() })
+        changes.addedEmails = localEmails.filter { !remoteEmailSet.contains($0.lowercased()) }
+        changes.removedEmails = remote.emails.filter { !localEmailSet.contains($0.lowercased()) }
 
-        let localEmails = Set(local.emailAddresses.map { ($0.value as String).lowercased() })
-        let remoteEmails = Set(remote.emails.map { $0.lowercased() })
-        if let emailType {
-            for added in localEmails.subtracting(remoteEmails) {
-                try await client.createContactField(
-                    contactID: remote.id, typeID: emailType.id, value: added
-                )
-            }
-            for removed in remoteEmails.subtracting(localEmails) {
-                if let field = (remote.contactFields ?? []).first(where: {
-                    $0.contactFieldType?.kind(matches: "email") == true
-                        && $0.content?.lowercased() == removed
-                }) {
-                    try await client.deleteContactField(id: field.id)
-                }
-            }
-        }
+        let localPhones = local.phoneNumbers.map { $0.value.stringValue }
+        let localPhoneSet = Set(localPhones.map(normalizedPhone))
+        let remotePhoneSet = Set(remote.phones.map(normalizedPhone))
+        changes.addedPhones = localPhones.filter { !remotePhoneSet.contains(normalizedPhone($0)) }
+        changes.removedPhones = remote.phones.filter { !localPhoneSet.contains(normalizedPhone($0)) }
 
-        let localPhones = Set(local.phoneNumbers.map { Self.normalizedPhone($0.value.stringValue) })
-        let remotePhones = Set(remote.phones.map(Self.normalizedPhone))
-        if let phoneType {
-            for added in local.phoneNumbers
-            where !remotePhones.contains(Self.normalizedPhone(added.value.stringValue)) {
-                try await client.createContactField(
-                    contactID: remote.id, typeID: phoneType.id, value: added.value.stringValue
-                )
-            }
-            for field in remote.contactFields ?? []
-            where field.contactFieldType?.kind(matches: "phone") == true {
-                let content = Self.normalizedPhone(field.content ?? "")
-                if !content.isEmpty && !localPhones.contains(content) {
-                    try await client.deleteContactField(id: field.id)
-                }
-            }
-        }
+        return changes
     }
 
     // MARK: - Orphan removal
 
-    private func removeOrphans(remoteIDs: Set<Int>) -> Int {
+    private func removeOrphans(remoteIDs: Set<String>) -> Int {
         var removed = 0
         for key in mappings.keys(withPrefix: "contact:") {
-            guard let id = Int(key.split(separator: ":")[1]), !remoteIDs.contains(id),
-                  let record = mappings[key]
-            else { continue }
+            let id = String(key.dropFirst("contact:".count))
+            guard !remoteIDs.contains(id), let record = mappings[key] else { continue }
             if !record.deletedLocally, let local = fetchLocal(record.localIdentifier) {
                 let request = CNSaveRequest()
                 request.delete(local.mutableCopy() as! CNMutableContact)
@@ -350,33 +309,28 @@ final class ContactsSyncEngine {
         let request = CNSaveRequest()
         request.add(group, toContainerWithIdentifier: nil)
         try store.execute(request)
-        return group.copy() as! CNGroup
+        return group
     }
 
     // MARK: - Fingerprints
 
     /// Both sides canonicalize to the same field list so an in-sync pair
     /// yields `remoteParts == localParts`.
-    private static func remoteParts(of contact: MonicaContact) -> [String?] {
+    private static func remoteParts(of contact: SyncContact) -> [String?] {
         var parts: [String?] = [
             contact.firstName,
             contact.lastName,
             contact.nickname,
-            contact.information?.career?.company,
-            contact.information?.career?.job,
+            contact.company,
+            contact.jobTitle,
         ]
-        parts.append(birthdayPart(
-            date: contact.information?.dates?.birthdate?.date,
-            yearUnknown: contact.information?.dates?.birthdate?.isYearUnknown == true
-                || contact.information?.dates?.birthdate?.isAgeBased == true
-        ))
+        parts.append(contact.birthday.map {
+            birthdayString(year: $0.year, month: $0.month, day: $0.day)
+        })
         parts.append(contact.emails.map { $0.lowercased() }.sorted().joined(separator: "|"))
         parts.append(contact.phones.map(normalizedPhone).sorted().joined(separator: "|"))
         parts.append(
-            (contact.addresses ?? [])
-                .map(\.oneLine)
-                .sorted()
-                .joined(separator: "|")
+            contact.addresses.map(\.oneLine).sorted().joined(separator: "|")
         )
         return parts
     }
@@ -419,15 +373,6 @@ final class ContactsSyncEngine {
                 .joined(separator: "|")
         )
         return parts
-    }
-
-    private static func birthdayPart(date: Date?, yearUnknown: Bool) -> String? {
-        guard let date else { return nil }
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "UTC") ?? .current
-        let components = calendar.dateComponents([.year, .month, .day], from: date)
-        guard let month = components.month, let day = components.day else { return nil }
-        return birthdayString(year: yearUnknown ? nil : components.year, month: month, day: day)
     }
 
     private static func birthdayString(year: Int?, month: Int, day: Int) -> String {
