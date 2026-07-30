@@ -42,7 +42,7 @@ struct OnboardingView: View {
                 } header: {
                     Text("API token")
                 } footer: {
-                    Text("Create one on your Monica server under Settings → API → Create a token, then paste it here. The token is stored in the iPhone's Keychain.")
+                    Text("Create one on your Monica server — Settings → API on classic Monica, Settings → API Tokens on Monica v5 (give it read and write abilities) — then paste it here. The token is stored in the iPhone's Keychain.")
                 }
 
                 if let errorMessage {
@@ -52,20 +52,44 @@ struct OnboardingView: View {
                     }
                 }
 
-                Section {
-                    Button {
-                        connect()
-                    } label: {
-                        if isConnecting {
-                            HStack {
-                                ProgressView()
-                                Text("Connecting…")
+                if let vaults = model.pendingVaults {
+                    Section {
+                        ForEach(vaults) { vault in
+                            Button {
+                                model.selectVault(vault)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(vault.name)
+                                        .foregroundStyle(.primary)
+                                    if let description = vault.description, !description.isEmpty {
+                                        Text(description)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
                             }
-                        } else {
-                            Text("Connect")
                         }
+                    } header: {
+                        Text("Choose a vault")
+                    } footer: {
+                        Text("This server has several vaults. Pick the one to browse and sync — you can switch later in Settings.")
                     }
-                    .disabled(isConnecting || token.trimmingCharacters(in: .whitespaces).isEmpty)
+                } else {
+                    Section {
+                        Button {
+                            connect()
+                        } label: {
+                            if isConnecting {
+                                HStack {
+                                    ProgressView()
+                                    Text("Connecting…")
+                                }
+                            } else {
+                                Text("Connect")
+                            }
+                        }
+                        .disabled(isConnecting || token.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
                 }
             }
             .navigationTitle("Monica")

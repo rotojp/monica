@@ -52,7 +52,7 @@ final class SyncMappingStore {
         }
     }
 
-    static func key(_ type: String, _ id: Int) -> String { "\(type):\(id)" }
+    static func key(_ type: String, _ id: String) -> String { "\(type):\(id)" }
 
     subscript(key: String) -> SyncRecord? {
         get { records[key] }
